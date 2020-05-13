@@ -6,10 +6,7 @@ use tidb_query_codegen::rpn_fn;
 use tidb_query_common::Result;
 use tidb_query_datatype::codec::data_type::*;
 use tidb_query_datatype::*;
-use tidb_query_shared_expr::string::{
-    encoded_size, line_wrap, strip_whitespace, validate_target_len_for_pad,
-    BASE64_ENCODED_CHUNK_LENGTH, BASE64_INPUT_CHUNK_LENGTH,
-};
+use tidb_query_shared_expr::string::{encoded_size, line_wrap, validate_target_len_for_pad};
 
 const SPACE: u8 = 0o40u8;
 
@@ -118,6 +115,39 @@ pub fn rtrim(arg: &Option<Bytes>) -> Result<Option<Bytes>> {
             Vec::new()
         }
     }))
+}
+
+#[rpn_fn]
+#[inline]
+pub fn rpad_utf8(
+    arg: &Option<Bytes>,
+    len: &Option<Int>,
+    pad: &Option<Bytes>,
+) -> Result<Option<Bytes>> {
+    match (arg, len, pad) {
+        (Some(arg), Some(len), Some(pad)) => match str::from_utf8(&*arg) {
+            Ok(s) => match str::from_utf8(&*pad) {
+                Ok(p) => {
+                    let s_len = s.chars().count();
+                    match validate_target_len_for_pad(*len < 0, *len, s_len, 4, pad.is_empty()) {
+                        None => Ok(None),
+                        Some(0) => Ok(Some(b"".to_vec())),
+                        Some(target_len) => {
+                            let r = s
+                                .chars()
+                                .chain(p.chars().cycle())
+                                .take(target_len)
+                                .collect::<String>();
+                            Ok(Some(r.into_bytes()))
+                        }
+                    }
+                }
+                Err(err) => Err(box_err!("invalid pad value: {:?}", err)),
+            },
+            Err(err) => Err(box_err!("invalid input value: {:?}", err)),
+        },
+        _ => Ok(None),
+    }
 }
 
 #[rpn_fn]
@@ -492,28 +522,6 @@ pub fn to_base64(bs: &Option<Bytes>) -> Result<Option<Bytes>> {
             }
         }
         None => Ok(None),
-    }
-}
-
-#[rpn_fn]
-#[inline]
-pub fn from_base64(bs: &Option<Bytes>) -> Result<Option<Bytes>> {
-    match bs.as_ref() {
-        Some(bytes) => {
-            let input_copy = strip_whitespace(bytes);
-            let will_overflow = input_copy
-                .len()
-                .checked_mul(BASE64_INPUT_CHUNK_LENGTH)
-                .is_none();
-            // mysql will return "" when the input is incorrectly padded
-            let invalid_padding = input_copy.len() % BASE64_ENCODED_CHUNK_LENGTH != 0;
-            if will_overflow || invalid_padding {
-                Ok(Some(Vec::new()))
-            } else {
-                Ok(base64::decode_config(&input_copy, base64::STANDARD).ok())
-            }
-        }
-        _ => Ok(None),
     }
 }
 
@@ -942,6 +950,109 @@ mod tests {
                 .evaluate(ScalarFuncSig::RTrim)
                 .unwrap();
             assert_eq!(output, expect_output.map(|s| s.as_bytes().to_vec()));
+        }
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn common_rpad_cases() -> Vec<(Option<Bytes>, Option<Int>, Option<Bytes>, Option<Bytes>)> {
+        vec![
+            (
+                Some(b"hi".to_vec()),
+                Some(5),
+                Some(b"?".to_vec()),
+                Some(b"hi???".to_vec()),
+            ),
+            (
+                Some(b"hi".to_vec()),
+                Some(1),
+                Some(b"?".to_vec()),
+                Some(b"h".to_vec()),
+            ),
+            (
+                Some(b"hi".to_vec()),
+                Some(0),
+                Some(b"?".to_vec()),
+                Some(b"".to_vec()),
+            ),
+            (
+                Some(b"hi".to_vec()),
+                Some(1),
+                Some(b"".to_vec()),
+                Some(b"h".to_vec()),
+            ),
+            (
+                Some(b"hi".to_vec()),
+                Some(5),
+                Some(b"ab".to_vec()),
+                Some(b"hiaba".to_vec()),
+            ),
+            (
+                Some(b"hi".to_vec()),
+                Some(6),
+                Some(b"ab".to_vec()),
+                Some(b"hiabab".to_vec()),
+            ),
+            (Some(b"hi".to_vec()), Some(-1), Some(b"?".to_vec()), None),
+            (Some(b"hi".to_vec()), Some(5), Some(b"".to_vec()), None),
+            (
+                Some(b"hi".to_vec()),
+                Some(0),
+                Some(b"".to_vec()),
+                Some(b"".to_vec()),
+            ),
+        ]
+    }
+
+    #[test]
+    fn test_rpad_utf8() {
+        let mut cases = vec![
+            (
+                Some("a多字节".as_bytes().to_vec()),
+                Some(3),
+                Some("测试".as_bytes().to_vec()),
+                Some("a多字".as_bytes().to_vec()),
+            ),
+            (
+                Some("a多字节".as_bytes().to_vec()),
+                Some(4),
+                Some("测试".as_bytes().to_vec()),
+                Some("a多字节".as_bytes().to_vec()),
+            ),
+            (
+                Some("a多字节".as_bytes().to_vec()),
+                Some(5),
+                Some("测试".as_bytes().to_vec()),
+                Some("a多字节测".as_bytes().to_vec()),
+            ),
+            (
+                Some("a多字节".as_bytes().to_vec()),
+                Some(6),
+                Some("测试".as_bytes().to_vec()),
+                Some("a多字节测试".as_bytes().to_vec()),
+            ),
+            (
+                Some("a多字节".as_bytes().to_vec()),
+                Some(7),
+                Some("测试".as_bytes().to_vec()),
+                Some("a多字节测试测".as_bytes().to_vec()),
+            ),
+            (
+                Some("a多字节".as_bytes().to_vec()),
+                Some(i64::from(MAX_BLOB_WIDTH) / 4 + 1),
+                Some("测试".as_bytes().to_vec()),
+                None,
+            ),
+        ];
+        cases.append(&mut common_rpad_cases());
+
+        for (arg, len, pad, expect_output) in cases {
+            let output = RpnFnScalarEvaluator::new()
+                .push_param(arg)
+                .push_param(len)
+                .push_param(pad)
+                .evaluate(ScalarFuncSig::RpadUtf8)
+                .unwrap();
+            assert_eq!(output, expect_output);
         }
     }
 
@@ -1943,48 +2054,5 @@ mod tests {
                 .unwrap();
             assert_eq!(output, expected_output);
         }
-    }
-
-    #[test]
-    fn test_from_base64() {
-        let tests = vec![
-            ("", ""),
-            ("YWJj", "abc"),
-            ("YWIgYw==", "ab c"),
-            ("YWIKYw==", "ab\nc"),
-            ("YWIJYw==", "ab\tc"),
-            ("cXdlcnR5MTIzNDU2", "qwerty123456"),
-            (
-                "QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVphYmNkZWZnaGlqa2xtbm9wcXJzdHV2d3h5ejAxMjM0\nNTY3ODkrL0FCQ0RFRkdISUpLTE1OT1BRUlNUVVZXWFlaYWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4\neXowMTIzNDU2Nzg5Ky9BQkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWmFiY2RlZmdoaWprbG1ub3Bx\ncnN0dXZ3eHl6MDEyMzQ1Njc4OSsv",
-                "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/",
-            ),
-            (
-                "QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVphYmNkZWZnaGlqa2xtbm9wcXJzdHV2d3h5ejAxMjM0NTY3ODkrLw==",
-                "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/",
-            ),
-            (
-                "QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVphYmNkZWZnaGlqa2xtbm9wcXJzdHV2d3h5ejAxMjM0NTY3ODkrLw==",
-                "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/",
-            ),
-            (
-                "QUJDREVGR0hJSkt\tMTU5PUFFSU1RVVld\nYWVphYmNkZ\rWZnaGlqa2xt   bm9wcXJzdHV2d3h5ejAxMjM0NTY3ODkrLw==",
-                "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/",
-            ),
-        ];
-        for (arg, expected) in tests {
-            let param = Some(arg.to_string().into_bytes());
-            let expected_output = Some(expected.to_string().into_bytes());
-            let output = RpnFnScalarEvaluator::new()
-                .push_param(param)
-                .evaluate::<Bytes>(ScalarFuncSig::FromBase64)
-                .unwrap();
-            assert_eq!(output, expected_output);
-        }
-
-        let invalid_base64_output = RpnFnScalarEvaluator::new()
-            .push_param(Some(b"src".to_vec()))
-            .evaluate(ScalarFuncSig::FromBase64)
-            .unwrap();
-        assert_eq!(invalid_base64_output, Some(b"".to_vec()));
     }
 }
